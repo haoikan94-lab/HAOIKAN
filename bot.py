@@ -38,12 +38,12 @@ def beijing_date_str():
 def beijing_time_str():
     return beijing_now().strftime("%H:%M:%S")
 
-# ================== ACTIONS ==================
+# ================== ACTIONS（已按要求修改） ==================
 ACTIONS = {
-    "1": {"name": "第一班上班", "time": "09:00", "is_work": True,  "type": "work", "early_allowed": "08:00"},
-    "2": {"name": "第一班下班", "time": "15:00", "is_work": False, "type": "work", "max_time": "15:59"},
-    "3": {"name": "第二班上班", "time": "17:00", "is_work": True,  "type": "work", "early_allowed": "16:00"},
-    "4": {"name": "第二班下班", "time": "23:00", "is_work": False, "type": "work", "max_time": "23:59"},
+    "1": {"name": "第一班上班", "time": "14:00", "is_work": True,  "type": "work", "early_allowed": "13:00"},
+    "2": {"name": "第一班下班", "time": "19:00", "is_work": False, "type": "work", "max_time": "19:59"},
+    "3": {"name": "第二班上班", "time": "21:00", "is_work": True,  "type": "work", "early_allowed": "20:00"},
+    "4": {"name": "第二班下班", "time": "04:00", "is_work": False, "type": "work", "max_time": "04:59"},
     "5": {"name": "开始休息",   "time": None,    "is_work": False, "type": "rest_start"},
     "6": {"name": "结束休息",   "time": None,    "is_work": False, "type": "rest_end"},
 }
@@ -110,12 +110,17 @@ async def get_group_owner(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         print(f"获取群主失败 {chat_id}: {e}")
     return None
 
-# ================== 自动发送日报表 ==================
+# ================== 自动发送日报表（凌晨05:10） ==================
 async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
-    today_str = beijing_date_str()
+    # 凌晨05:10 发送的是“昨天”的完整打卡周期
+    today = beijing_now()
+    if today.hour < 5:
+        report_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        report_date = today.strftime("%Y-%m-%d")
     
-    print(f"📊 开始生成 {today_str} 全群日报表...")
+    print(f"📊 开始生成 {report_date} 全群日报表（05:10定时任务）...")
 
     for chat_id_str, chat_data in data.items():
         chat_id = int(chat_id_str)
@@ -132,44 +137,85 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
             print(f"⚠️ 群 {chat_id} 没有接收人，跳过")
             continue
 
-        rows = []
+        registered = chat_data.get("registered", {})
         users = chat_data.get("users", {})
-        has_record = False
 
-        for user_info in users.values():
-            records = user_info.get("records", {}).get(today_str, [])
-            if not records:
-                continue
+        rows = []
+        has_any_record = False
 
-            has_record = True
+        for user_id, user_name in registered.items():
+            user_info = users.get(user_id, {"name": user_name, "records": {}})
+            records = user_info.get("records", {}).get(report_date, [])
+
             rest_count = sum(1 for r in records if r.get("type") == "rest_end")
             total_rest = sum(r.get("rest_minutes", 0) for r in records if r.get("type") == "rest_end")
 
-            for r in records:
-                if r.get("type") in ["rest_start", "rest_end"]:
-                    continue
+            main_actions = [r for r in records if r.get("action") in ["1", "2", "3", "4"]]
+            missing = []
+
+            # 根据日期判断应打的班次（跨天逻辑简化处理）
+            # 第一班周期：1和2
+            # 第二班周期：3和4（第二班下班可能在第二天凌晨）
+            expected = ["1", "2", "3", "4"]
+
+            done_actions = {r.get("action") for r in main_actions}
+            incomplete = [a for a in expected if a not in done_actions]
+
+            user_has_record = len(main_actions) > 0
+
+            if user_has_record:
+                has_any_record = True
+
+            for r in main_actions:
                 rows.append({
                     "姓名": user_info.get("name", "未知"),
-                    "日期": today_str,
+                    "日期": report_date,
                     "班次": ACTIONS.get(r.get("action"), {}).get("name", r.get("action")),
                     "打卡时间": r["time"],
                     "状态": r.get("display", ""),
                     "迟到分钟": r.get("late_min", 0),
                     "休息次数": rest_count,
-                    "总休息分钟": total_rest
+                    "总休息分钟": total_rest,
+                    "缺卡情况": "正常" if not incomplete else f"缺卡: {','.join(incomplete)}"
                 })
 
-        filename = f"全群打卡日报_{today_str}.xlsx"
+            # 如果完全没有主班次记录，也要显示该用户
+            if not main_actions:
+                rows.append({
+                    "姓名": user_info.get("name", "未知"),
+                    "日期": report_date,
+                    "班次": "无打卡记录",
+                    "打卡时间": "",
+                    "状态": "缺卡",
+                    "迟到分钟": 0,
+                    "休息次数": 0,
+                    "总休息分钟": 0,
+                    "缺卡情况": f"缺卡: 1,2,3,4"
+                })
+
+        filename = f"全群打卡日报_{report_date}.xlsx"
         filepath = os.path.join(EXCEL_FOLDER, filename)
 
         try:
             if rows:
-                pd.DataFrame(rows).to_excel(filepath, index=False)
-                caption = f"📊 **{today_str} 全群打卡日报** 已生成\n共 {len(set(r['姓名'] for r in rows))} 人有打卡记录"
+                df = pd.DataFrame(rows)
+                # 确保列顺序
+                cols = ["姓名","日期","班次","打卡时间","状态","迟到分钟","休息次数","总休息分钟","缺卡情况"]
+                df = df[cols]
+                df.to_excel(filepath, index=False)
+                
+                total_users = len(registered)
+                users_with_record = len([r for r in rows if r["班次"] != "无打卡记录"])
+                
+                caption = f"📊 **{report_date} 全群打卡日报** 已生成\n\n"
+                caption += f"👥 总注册人数: {total_users} 人\n"
+                caption += f"📍 有打卡记录: {users_with_record} 人\n"
+                if total_users > 0:
+                    caption += f"❌ 未打卡/缺卡: {total_users - users_with_record} 人"
             else:
-                empty_df = pd.DataFrame(columns=["姓名","日期","班次","打卡时间","状态","迟到分钟","休息次数","总休息分钟"])
+                empty_df = pd.DataFrame(columns=["姓名","日期","班次","打卡时间","状态","迟到分钟","休息次数","总休息分钟","缺卡情况"])
                 empty_df.to_excel(filepath, index=False)
-                caption = f"📊 **{today_str} 全群打卡日报**\n\n今日暂无打卡记录"
+                caption = f"📊 **{report_date} 全群打卡日报**\n\n该周期暂无注册人员"
 
             sent_count = 0
             for recipient_id in recipients:
@@ -186,7 +232,7 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     print(f"发送日报失败 {recipient_id} (群{chat_id}): {e}")
 
-            print(f"✅ 已成功发送 {today_str} 日报表给群 {chat_id} 的 {sent_count}/{len(recipients)} 位接收人")
+            print(f"✅ 已成功发送 {report_date} 日报表给群 {chat_id} 的 {sent_count}/{len(recipients)} 位接收人")
         except Exception as e:
             print(f"❌ 生成或发送日报表失败 (群{chat_id}): {e}")
 
@@ -209,22 +255,42 @@ def is_valid_checkin_time(shift: str) -> tuple[bool, str]:
     now = beijing_now()
     now_time = now.strftime("%H:%M")
 
-    if shift == "1" and now_time > "15:00":
-        return False, "❌ 15:00 之后不能再打第一班上班（1）"
-    if shift == "3" and now_time > "23:00":
-        return False, "❌ 23:00 之后不能再打第二班上班（3）"
+    # 第一班上班（1）：13:00 之后
+    if shift == "1":
+        if now_time < "13:00":
+            return False, "❌ 第一班上班最早 13:00 才能打卡！"
+        if now_time > "20:00":
+            return False, "❌ 20:00 之后不能再打第一班上班（1）"
 
+    # 第一班下班（2）：20:00 之前
+    if shift == "2":
+        if now_time >= "20:00":
+            return False, "❌ 第一班下班必须在 20:00 前打卡！"
+
+    # 第二班上班（3）：20:00 之后
+    if shift == "3":
+        if now_time <= "20:00":
+            return False, "❌ 第二班上班必须在 20:00 之后才能打卡！"
+
+    # 第二班下班（4）：次日 05:00 之前
+    if shift == "4":
+        if now_time >= "05:00" and now.hour < 12:
+            return False, "❌ 第二班下班必须在 05:00 前打卡！"
+
+    # 通用 early_allowed 检查
     if "early_allowed" in action:
         early_time = datetime.strptime(action["early_allowed"], "%H:%M").replace(
             year=now.year, month=now.month, day=now.day, tzinfo=TZ)
         if now < early_time:
             return False, f"❌ {action['name']} 最早 {action['early_allowed']} 才能打卡！"
 
+    # 通用 max_time 检查
     if "max_time" in action:
-        max_time = datetime.strptime(action["max_time"], "%H:%M").replace(
+        max_t = action["max_time"]
+        max_time = datetime.strptime(max_t, "%H:%M").replace(
             year=now.year, month=now.month, day=now.day, tzinfo=TZ)
-        if now > max_time:
-            return False, f"❌ {action['name']} 必须在 {action['max_time']} 前打卡！"
+        if now > max_time and not (shift == "4" and now.hour < 5):
+            return False, f"❌ {action['name']} 必须在 {max_t} 前打卡！"
 
     return True, ""
 
@@ -244,7 +310,6 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
     user = update.effective_user
     user_id = str(user.id)
 
-    # 所有打卡都自动注册
     await auto_register(update, context)
 
     now = beijing_now()
@@ -642,7 +707,7 @@ def main():
     job_queue: JobQueue = app.job_queue
 
     job_queue.run_daily(cleanup_old_data, time=time(23, 59, 59, tzinfo=TZ))
-    job_queue.run_daily(send_daily_report, time=time(23, 59, 59, tzinfo=TZ))
+    job_queue.run_daily(send_daily_report, time=time(5, 10, 0, tzinfo=TZ))
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("register", register))
@@ -659,7 +724,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🤖 打卡机器人已成功启动 | 每日报表自动发送功能已启用（北京时间23:59:59）")
+    print("🤖 打卡机器人已成功启动 | 每日05:10自动发送完整日报表功能已启用")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
