@@ -16,13 +16,11 @@ print(f"✅ Bot Token 已成功加载 | 长度: {len(TOKEN)}")
 
 # ================== Railway Volume 持久化配置 ==================
 DATA_PATH = os.getenv("DATA_PATH", "/data")
-
 if not os.path.exists(DATA_PATH):
     os.makedirs(DATA_PATH)
 
 DATA_FILE = os.path.join(DATA_PATH, "group_attendance.json")
 EXCEL_FOLDER = os.path.join(DATA_PATH, "excel_files")
-
 if not os.path.exists(EXCEL_FOLDER):
     os.makedirs(EXCEL_FOLDER)
 
@@ -38,7 +36,16 @@ def beijing_date_str():
 def beijing_time_str():
     return beijing_now().strftime("%H:%M:%S")
 
-# ================== ACTIONS（已按要求修改） ==================
+# ================== 报表日期逻辑（跨天班次） ==================
+def get_report_date(for_datetime: datetime = None) -> str:
+    """获取正确的日报表日期（以第二班下班所在的日期为准）"""
+    if for_datetime is None:
+        for_datetime = beijing_now()
+    if for_datetime.hour < 5:
+        return (for_datetime - timedelta(days=1)).strftime("%Y-%m-%d")
+    return for_datetime.strftime("%Y-%m-%d")
+
+# ================== ACTIONS ==================
 ACTIONS = {
     "1": {"name": "第一班上班", "time": "14:00", "is_work": True,  "type": "work", "early_allowed": "13:00"},
     "2": {"name": "第一班下班", "time": "19:00", "is_work": False, "type": "work", "max_time": "19:59"},
@@ -110,38 +117,30 @@ async def get_group_owner(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         print(f"获取群主失败 {chat_id}: {e}")
     return None
 
-# ================== 自动发送日报表（凌晨05:10） ==================
+# ================== 自动发送日报表 ==================
 async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    # 凌晨05:10 发送的是“昨天”的完整打卡周期
-    today = beijing_now()
-    if today.hour < 5:
-        report_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
-        report_date = today.strftime("%Y-%m-%d")
-    
-    print(f"📊 开始生成 {report_date} 全群日报表（05:10定时任务）...")
+    now = beijing_now()
+    report_date = get_report_date(now)
+    print(f"📊 开始生成 {report_date} 全群日报表...")
 
+    data = load_data()
     for chat_id_str, chat_data in data.items():
         chat_id = int(chat_id_str)
         recipients = set()
-        
         owner_id = await get_group_owner(context, chat_id)
         if owner_id:
             recipients.add(owner_id)
-        
         admins = get_admins(chat_id_str)
         recipients.update(int(uid) for uid in admins)
         
         if not recipients:
-            print(f"⚠️ 群 {chat_id} 没有接收人，跳过")
             continue
 
         registered = chat_data.get("registered", {})
         users = chat_data.get("users", {})
 
         rows = []
-        has_any_record = False
+        user_status = {}
 
         for user_id, user_name in registered.items():
             user_info = users.get(user_id, {"name": user_name, "records": {}})
@@ -151,38 +150,15 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
             total_rest = sum(r.get("rest_minutes", 0) for r in records if r.get("type") == "rest_end")
 
             main_actions = [r for r in records if r.get("action") in ["1", "2", "3", "4"]]
-            missing = []
-
-            # 根据日期判断应打的班次（跨天逻辑简化处理）
-            # 第一班周期：1和2
-            # 第二班周期：3和4（第二班下班可能在第二天凌晨）
-            expected = ["1", "2", "3", "4"]
-
             done_actions = {r.get("action") for r in main_actions}
-            incomplete = [a for a in expected if a not in done_actions]
+            incomplete = [a for a in ["1","2","3","4"] if a not in done_actions]
+            
+            status = "正常" if not incomplete else f"缺卡: {','.join(incomplete)}"
+            user_status[user_name] = status
 
-            user_has_record = len(main_actions) > 0
-
-            if user_has_record:
-                has_any_record = True
-
-            for r in main_actions:
-                rows.append({
-                    "姓名": user_info.get("name", "未知"),
-                    "日期": report_date,
-                    "班次": ACTIONS.get(r.get("action"), {}).get("name", r.get("action")),
-                    "打卡时间": r["time"],
-                    "状态": r.get("display", ""),
-                    "迟到分钟": r.get("late_min", 0),
-                    "休息次数": rest_count,
-                    "总休息分钟": total_rest,
-                    "缺卡情况": "正常" if not incomplete else f"缺卡: {','.join(incomplete)}"
-                })
-
-            # 如果完全没有主班次记录，也要显示该用户
             if not main_actions:
                 rows.append({
-                    "姓名": user_info.get("name", "未知"),
+                    "姓名": user_name,
                     "日期": report_date,
                     "班次": "无打卡记录",
                     "打卡时间": "",
@@ -190,8 +166,21 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
                     "迟到分钟": 0,
                     "休息次数": 0,
                     "总休息分钟": 0,
-                    "缺卡情况": f"缺卡: 1,2,3,4"
+                    "缺卡情况": "缺卡: 1,2,3,4"
                 })
+            else:
+                for r in main_actions:
+                    rows.append({
+                        "姓名": user_name,
+                        "日期": report_date,
+                        "班次": ACTIONS.get(r.get("action"), {}).get("name", r.get("action")),
+                        "打卡时间": r["time"],
+                        "状态": r.get("display", ""),
+                        "迟到分钟": r.get("late_min", 0),
+                        "休息次数": rest_count,
+                        "总休息分钟": total_rest,
+                        "缺卡情况": status
+                    })
 
         filename = f"全群打卡日报_{report_date}.xlsx"
         filepath = os.path.join(EXCEL_FOLDER, filename)
@@ -199,42 +188,29 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
         try:
             if rows:
                 df = pd.DataFrame(rows)
-                # 确保列顺序
                 cols = ["姓名","日期","班次","打卡时间","状态","迟到分钟","休息次数","总休息分钟","缺卡情况"]
                 df = df[cols]
                 df.to_excel(filepath, index=False)
                 
                 total_users = len(registered)
-                users_with_record = len([r for r in rows if r["班次"] != "无打卡记录"])
-                
-                caption = f"📊 **{report_date} 全群打卡日报** 已生成\n\n"
-                caption += f"👥 总注册人数: {total_users} 人\n"
-                caption += f"📍 有打卡记录: {users_with_record} 人\n"
-                if total_users > 0:
-                    caption += f"❌ 未打卡/缺卡: {total_users - users_with_record} 人"
+                normal_count = sum(1 for s in user_status.values() if s == "正常")
+                caption = f"📊 **{report_date} 全群打卡日报** 已生成\n\n👥 总注册人数: {total_users} 人\n✅ 正常完成: {normal_count} 人\n❌ 未完成: {total_users - normal_count} 人"
             else:
                 empty_df = pd.DataFrame(columns=["姓名","日期","班次","打卡时间","状态","迟到分钟","休息次数","总休息分钟","缺卡情况"])
                 empty_df.to_excel(filepath, index=False)
                 caption = f"📊 **{report_date} 全群打卡日报**\n\n该周期暂无注册人员"
 
-            sent_count = 0
             for recipient_id in recipients:
                 try:
                     with open(filepath, 'rb') as f:
                         await context.bot.send_document(
-                            chat_id=recipient_id,
-                            document=f,
-                            filename=filename,
-                            caption=caption,
-                            parse_mode="Markdown"
+                            chat_id=recipient_id, document=f, filename=filename, 
+                            caption=caption, parse_mode="Markdown"
                         )
-                    sent_count += 1
                 except Exception as e:
-                    print(f"发送日报失败 {recipient_id} (群{chat_id}): {e}")
-
-            print(f"✅ 已成功发送 {report_date} 日报表给群 {chat_id} 的 {sent_count}/{len(recipients)} 位接收人")
+                    print(f"发送日报失败 {recipient_id}: {e}")
         except Exception as e:
-            print(f"❌ 生成或发送日报表失败 (群{chat_id}): {e}")
+            print(f"生成或发送日报表失败: {e}")
 
 # ================== 辅助函数 ==================
 def get_late_minutes(expected_time: str) -> int:
@@ -255,36 +231,27 @@ def is_valid_checkin_time(shift: str) -> tuple[bool, str]:
     now = beijing_now()
     now_time = now.strftime("%H:%M")
 
-    # 第一班上班（1）：13:00 之后
     if shift == "1":
         if now_time < "13:00":
             return False, "❌ 第一班上班最早 13:00 才能打卡！"
         if now_time > "20:00":
             return False, "❌ 20:00 之后不能再打第一班上班（1）"
-
-    # 第一班下班（2）：20:00 之前
     if shift == "2":
         if now_time >= "20:00":
             return False, "❌ 第一班下班必须在 20:00 前打卡！"
-
-    # 第二班上班（3）：20:00 之后
     if shift == "3":
         if now_time <= "20:00":
             return False, "❌ 第二班上班必须在 20:00 之后才能打卡！"
-
-    # 第二班下班（4）：次日 05:00 之前
     if shift == "4":
-        if now_time >= "05:00" and now.hour < 12:
+        if now.hour >= 5 and now.hour < 12:
             return False, "❌ 第二班下班必须在 05:00 前打卡！"
 
-    # 通用 early_allowed 检查
     if "early_allowed" in action:
         early_time = datetime.strptime(action["early_allowed"], "%H:%M").replace(
             year=now.year, month=now.month, day=now.day, tzinfo=TZ)
         if now < early_time:
             return False, f"❌ {action['name']} 最早 {action['early_allowed']} 才能打卡！"
 
-    # 通用 max_time 检查
     if "max_time" in action:
         max_t = action["max_time"]
         max_time = datetime.strptime(max_t, "%H:%M").replace(
@@ -303,7 +270,6 @@ def calculate_rest_duration(start_time_str: str, end_time_str: str) -> int:
         return int((end - start).total_seconds() / 60)
     except:
         return 0
-
 # ================== 核心打卡函数 ==================
 async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
     chat_id = str(update.effective_chat.id)
@@ -379,6 +345,7 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
         parse_mode="Markdown"
     )
 
+
 async def text_daka(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     mapping = {
@@ -391,6 +358,7 @@ async def text_daka(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     if text in mapping:
         await daka(update, context, mapping[text])
+
 
 async def auto_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -406,7 +374,8 @@ async def auto_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         await update.message.reply_text(f"✅ **{user_name}** 自动注册成功！", parse_mode="Markdown")
 
-# ================== 其他命令 ==================
+
+# ================== 命令处理函数 ==================
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     user_id = str(update.effective_user.id)
@@ -422,61 +391,19 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("✅ 你已经注册过了。")
 
-async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ 仅限管理员使用")
-        return
+
+async def registered_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    owner_id = await get_group_owner(context, int(chat_id))
-    if owner_id and owner_id != update.effective_user.id:
-        await update.message.reply_text("⚠️ 仅群主可添加/删除管理员")
+    data = load_data()
+    registered = data.get(chat_id, {}).get("registered", {})
+    if not registered:
+        await update.message.reply_text("📋 本群暂无已注册人员。")
         return
-
-    if not context.args:
-        await update.message.reply_text("用法：/addadmin 用户ID")
-        return
-
-    target_id = context.args[0].strip()
-    if save_admin(chat_id, target_id):
-        await update.message.reply_text(f"✅ 已添加管理员：`{target_id}`", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("✅ 该用户已是管理员")
-
-async def del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ 仅限管理员使用")
-        return
-    chat_id = str(update.effective_chat.id)
-    owner_id = await get_group_owner(context, int(chat_id))
-    if owner_id and owner_id != update.effective_user.id:
-        await update.message.reply_text("⚠️ 仅群主可添加/删除管理员")
-        return
-
-    if not context.args:
-        await update.message.reply_text("用法：/deladmin 用户ID")
-        return
-
-    target_id = context.args[0].strip()
-    if remove_admin(chat_id, target_id):
-        await update.message.reply_text(f"✅ 已删除管理员：`{target_id}`", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("❌ 该用户不是管理员")
-
-async def adminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ 仅限管理员使用")
-        return
-    chat_id = str(update.effective_chat.id)
-    admins = get_admins(chat_id)
-    owner_id = await get_group_owner(context, int(chat_id))
-    
-    text = "📋 **本群日报表接收人列表**\n\n"
-    if owner_id:
-        text += f"👑 群主: `{owner_id}`\n"
-    text += f"📌 指定管理员（{len(admins)}人）:\n"
-    for i, aid in enumerate(admins, 1):
-        text += f"{i}. `{aid}`\n"
+    text = f"📋 **本群已注册人员名单**（共 {len(registered)} 人）\n\n"
+    for i, (uid, name) in enumerate(registered.items(), 1):
+        text += f"{i}. {name} (ID: `{uid}`)\n"
     await update.message.reply_text(text, parse_mode="Markdown")
+
 
 async def myrecord(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -508,6 +435,7 @@ async def myrecord(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def is_admin(update: Update) -> bool:
     if update.effective_chat.type == "private":
         return True
@@ -517,17 +445,65 @@ async def is_admin(update: Update) -> bool:
     except:
         return False
 
-async def registered_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    data = load_data()
-    registered = data.get(chat_id, {}).get("registered", {})
-    if not registered:
-        await update.message.reply_text("📋 本群暂无已注册人员。")
+
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        await update.message.reply_text("⚠️ 仅限管理员使用")
         return
-    text = f"📋 **本群已注册人员名单**（共 {len(registered)} 人）\n\n"
-    for i, (uid, name) in enumerate(registered.items(), 1):
-        text += f"{i}. {name} (ID: `{uid}`)\n"
+    chat_id = str(update.effective_chat.id)
+    owner_id = await get_group_owner(context, int(chat_id))
+    if owner_id and owner_id != update.effective_user.id:
+        await update.message.reply_text("⚠️ 仅群主可添加/删除管理员")
+        return
+
+    if not context.args:
+        await update.message.reply_text("用法：/addadmin 用户ID")
+        return
+
+    target_id = context.args[0].strip()
+    if save_admin(chat_id, target_id):
+        await update.message.reply_text(f"✅ 已添加管理员：`{target_id}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("✅ 该用户已是管理员")
+
+
+async def del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        await update.message.reply_text("⚠️ 仅限管理员使用")
+        return
+    chat_id = str(update.effective_chat.id)
+    owner_id = await get_group_owner(context, int(chat_id))
+    if owner_id and owner_id != update.effective_user.id:
+        await update.message.reply_text("⚠️ 仅群主可添加/删除管理员")
+        return
+
+    if not context.args:
+        await update.message.reply_text("用法：/deladmin 用户ID")
+        return
+
+    target_id = context.args[0].strip()
+    if remove_admin(chat_id, target_id):
+        await update.message.reply_text(f"✅ 已删除管理员：`{target_id}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ 该用户不是管理员")
+
+
+async def adminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update):
+        await update.message.reply_text("⚠️ 仅限管理员使用")
+        return
+    chat_id = str(update.effective_chat.id)
+    admins = get_admins(chat_id)
+    owner_id = await get_group_owner(context, int(chat_id))
+    
+    text = "📋 **本群日报表接收人列表**\n\n"
+    if owner_id:
+        text += f"👑 群主: `{owner_id}`\n"
+    text += f"📌 指定管理员（{len(admins)}人）:\n"
+    for i, aid in enumerate(admins, 1):
+        text += f"{i}. `{aid}`\n"
     await update.message.reply_text(text, parse_mode="Markdown")
+
 
 async def deluser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
@@ -560,6 +536,7 @@ async def deluser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ 未找到该用户。")
 
+
 async def delete_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("⚠️ 仅限管理员使用")
@@ -578,6 +555,7 @@ async def delete_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
     await update.message.reply_text(f"✅ 已删除 {date_to_del} 的所有记录（影响 {count} 人）")
 
+
 async def todayexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("⚠️ 仅限管理员使用")
@@ -590,9 +568,9 @@ async def todayexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows = []
     for user_info in data.get(chat_id, {}).get("users", {}).values():
-        if today_str not in user_info.get("records", {}):
+        records = user_info.get("records", {}).get(today_str, [])
+        if not records:
             continue
-        records = user_info["records"][today_str]
         rest_count = sum(1 for r in records if r.get("type") == "rest_end")
         total_rest = sum(r.get("rest_minutes", 0) for r in records if r.get("type") == "rest_end")
 
@@ -613,13 +591,10 @@ async def todayexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rows:
         pd.DataFrame(rows).to_excel(filepath, index=False)
         with open(filepath, 'rb') as f:
-            await update.message.reply_document(
-                f, 
-                filename=filename, 
-                caption=f"✅ {today_str} 全群打卡报表"
-            )
+            await update.message.reply_document(f, filename=filename, caption=f"✅ {today_str} 全群打卡报表")
     else:
         await update.message.reply_text("今日暂无打卡记录")
+
 
 async def monthexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
@@ -655,13 +630,10 @@ async def monthexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rows:
         pd.DataFrame(rows).to_excel(filepath, index=False)
         with open(filepath, 'rb') as f:
-            await update.message.reply_document(
-                f, 
-                filename=filename, 
-                caption=f"✅ {current_month} 全群打卡月报表"
-            )
+            await update.message.reply_document(f, filename=filename, caption=f"✅ {current_month} 全群打卡月报表")
     else:
         await update.message.reply_text(f"{current_month} 暂无打卡记录")
+
 
 async def absent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
@@ -691,6 +663,7 @@ async def absent(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"{i}. {item}\n"
         await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "飞机的代号确定下来了就不要再改了，否则会打卡记录失败\n\n"
@@ -700,6 +673,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "如果遇到没有信号的缘故，或者帮公司做其他事情没办法及时打卡的，找公司组长或副组长证明补打卡后原因写上。其余不管是加班聊客户或者其他原因的也算迟到早退。\n\n"
         "私聊发送 /myrecord 可查询个人记录\n"
     )
+
 
 # ================== 主程序 ==================
 def main():
@@ -724,8 +698,9 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🤖 打卡机器人已成功启动 | 每日05:10自动发送完整日报表功能已启用")
+    print("🤖 打卡机器人已成功启动 | 跨天日报表逻辑已优化")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
