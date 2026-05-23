@@ -381,7 +381,11 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
     # 已下班不能再开始休息或暂离
     has_done_2_or_4 = any(r.get("action") in {"2", "4"} for r in records)
     if shift in ["5", "7"] and has_done_2_or_4:
-        await update.message.reply_text("⚠️ 已完成当班下班（2或4），不能再开始休息或暂离")
+        await update.message.reply_text(
+            "⚠️ **已完成当班下班**（2或4），\n"
+            "不能再开始休息或暂离！\n\n"
+            "如需继续操作，请等待下一班上班（1或3）。"
+        )
         return
 
     # 5和7必须先打上班卡（1或3）
@@ -823,7 +827,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🚀 打卡机器人已完全启动（啊原的第4个版本 -）")
+    print("🚀 打卡机器人已完全启动（啊原的第4个版本0.4.5）")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
