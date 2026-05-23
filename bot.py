@@ -374,19 +374,30 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
     user_data = chat_data["users"].setdefault(user_id, {"name": user.full_name, "records": {}})
     records = user_data["records"].setdefault(date_str, [])
 
+    # ================== 新增：判断当前是否处于上班状态 ==================
+    def is_currently_on_duty(recs):
+        """判断当前是否处于上班状态（有打开的班次未下班）"""
+        on_duty = False
+        for r in recs:
+            act = r.get("action")
+            if act in {"1", "3"}:   # 上班
+                on_duty = True
+            elif act in {"2", "4"}: # 下班
+                on_duty = False
+        return on_duty
+
     # 检查是否正在休息
     is_resting = any(r.get("type") == "rest_start" and "rest_minutes" not in r for r in records)
     is_work_resting = any(r.get("type") == "work_rest_start" and "rest_minutes" not in r for r in records)
 
-    # 已下班不能再开始休息或暂离
-    has_done_2_or_4 = any(r.get("action") in {"2", "4"} for r in records)
-    if shift in ["5", "7"] and has_done_2_or_4:
-        await update.message.reply_text(
-            "⚠️ **已完成当班下班**（2或4），\n"
-            "不能再开始休息或暂离！\n\n"
-            "如需继续操作，请等待下一班上班（1或3）。"
-        )
-        return
+    # ================== 修复后的休息/暂离逻辑 ==================
+    if shift in ["5", "7"]:
+        if not is_currently_on_duty(records):
+            await update.message.reply_text(
+                "⚠️ **当前不在上班状态**，无法开始休息或暂离！\n\n"
+                "请先打上班卡（1 或 3）后再操作。"
+            )
+            return
 
     # 5和7必须先打上班卡（1或3）
     if shift in ["5", "7"]:
@@ -827,7 +838,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🚀 打卡机器人已完全启动（啊原的第4个版本0.4.5）")
+    print("🚀 打卡机器人已完全启动（啊原的第4个版本。0.4.6）")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
