@@ -45,77 +45,146 @@ def get_attendance_date(now=None):
     return beijing_date_str(now)
 
 def get_record_date(shift: str, now=None) -> str:
-    """根据新规则获取记录日期"""
+    """根据打卡类型获取正确的记录日期 - 已修复 Shift 4 跨天逻辑"""
     if now is None:
         now = beijing_now()
+    
     base_date = get_attendance_date(now)
     
+    # Shift 4（第二班下班）在 05:00 之前打卡时，始终属于前一天
     if shift == "4" and now.hour < 5:
         return beijing_date_str(now - timedelta(days=1))
+    
     return base_date
 
-def is_valid_checkin_time(shift: str) -> tuple[bool, str]:
+# ================== 前一天考勤日期（用于05:30自动日报） ==================
+def get_previous_attendance_date(now=None) -> str:
+    if now is None:
+        now = beijing_now()
+    return beijing_date_str(now - timedelta(days=1))
+
+def get_report_date_for_daily() -> str:
+    return get_previous_attendance_date(beijing_now())
+
+# ================== 时间有效性检查 ==================
+def is_valid_checkin_time(shift: str, now: datetime = None) -> tuple[bool, str]:
+    """打卡时间有效性检查 - 支持传入指定时间（便于测试和历史记录处理）"""
     if shift not in {"1", "2", "3", "4"}:
         return True, ""
     
-    now = beijing_now()
+    if now is None:
+        now = beijing_now()
+    
     current_time = now.time()
     
-    if shift == "1":
+    if shift == "1":      # 第一班上班
         if current_time < time(13, 0):
             return False, "⚠️ 第一班上班需在 **13:00之后** 打卡"
-    elif shift == "2":
+    
+    elif shift == "2":    # 第一班下班
         if current_time >= time(20, 0):
             return False, "⚠️ 第一班下班需在 **20:00之前** 打卡"
-    elif shift == "3":
+    
+    elif shift == "3":    # 第二班上班
         if current_time < time(20, 0):
             return False, "⚠️ 第二班上班需在 **20:00之后** 打卡"
-    elif shift == "4":
+    
+    elif shift == "4":    # 第二班下班
+        # 必须在 00:00-05:00 之间
         if current_time >= time(5, 0):
             return False, "⚠️ 第二班下班需在 **05:00之前** 打卡（00:00-05:00）"
     
     return True, ""
 
 def is_valid_rest_time(shift: str) -> tuple[bool, str]:
-    """5和7仅允许在工作时段内打卡"""
     if shift not in {"5", "7"}:
         return True, ""
     
     now = beijing_now()
     current_time = now.time()
     
-    # 第一班工作时间: 14:00 - 19:00
     if time(14, 0) <= current_time < time(19, 0):
         return True, ""
-    
-    # 第二班工作时间: 21:00 - 05:00（跨天）
     if current_time >= time(21, 0) or current_time < time(5, 0):
         return True, ""
     
     return False, "⚠️ 休息/暂离（5或7）只能在以下工作时段打卡：\n• 第一班 14:00-19:00\n• 第二班 21:00-05:00"
 
-def get_late_minutes(expected: str, shift: str = None) -> int:
+def calculate_rest_duration(start_time_str: str, end_time_str: str) -> int:
+    """计算休息/暂离时长（分钟），支持跨天"""
+    try:
+        fmt = "%H:%M:%S"
+        start = datetime.datetime.strptime(start_time_str, fmt)
+        end = datetime.datetime.strptime(end_time_str, fmt)
+        
+        if end < start:
+            end += datetime.timedelta(days=1)
+        
+        delta = end - start
+        return int(delta.total_seconds() / 60)
+    except Exception as e:
+        print(f"⚠️ 计算休息时长失败: {e}")
+        return 0
+
+
+# ================== 状态判断工具函数 ==================
+def is_currently_on_duty(records: list) -> bool:
+    """
+    改进版在岗状态判断 - 采用更准确的两班制独立状态模型
+    规则：
+    - 1 和 3 为上班（开启班次）
+    - 2 和 4 为下班（关闭对应班次）
+    - 5/7 开始休息不影响在岗状态（仍在岗，只是休息中）
+    - 6/8 结束休息不改变在岗状态
+    """
+    if not records:
+        return False
+
+    # 使用两个标志分别跟踪两班状态
+    shift1_active = False   # 第一班是否处于上班状态
+    shift2_active = False   # 第二班是否处于上班状态
+
+    for r in records:
+        act = r.get("action")
+        
+        if act == "1":      # 第一班上班
+            shift1_active = True
+        elif act == "2":    # 第一班下班
+            shift1_active = False
+            
+        elif act == "3":    # 第二班上班
+            shift2_active = True
+        elif act == "4":    # 第二班下班
+            shift2_active = False
+            
+        # 休息相关不影响在岗状态（5/7 开始休息仍视为在岗）
+        # 6/8 结束休息也不改变班次状态
+
+    # 只要任意一班处于上班状态，即视为当前在岗
+    return shift1_active or shift2_active
+
+
+def has_started_work_today(records: list) -> bool:
+    """当天是否至少打过一次上班卡"""
+    return any(r.get("action") in {"1", "3"} for r in records)
+
+def get_late_minutes(expected: str, shift: str = None, now: datetime = None) -> int:
+    """迟到计算 - 支持传入指定时间"""
     if not expected or shift not in {"1", "3"}:
         return 0
-    now = beijing_now()
-    exp_hm = datetime.strptime(expected, "%H:%M").time()
-    expected_dt = now.replace(hour=exp_hm.hour, minute=exp_hm.minute, second=0, microsecond=0)
-    return max(0, int((now - expected_dt).total_seconds() / 60))
-
-def calculate_rest_duration(start_str: str, end_str: str) -> int:
+    
+    if now is None:
+        now = beijing_now()
+    
     try:
-        start = datetime.strptime(start_str, "%H:%M:%S")
-        end = datetime.strptime(end_str, "%H:%M:%S")
-        if end < start:
-            end += timedelta(days=1)
-        return int((end - start).total_seconds() / 60)
+        exp_hm = datetime.strptime(expected, "%H:%M").time()
+        expected_dt = now.replace(hour=exp_hm.hour, minute=exp_hm.minute, 
+                                second=0, microsecond=0)
+        return max(0, int((now - expected_dt).total_seconds() / 60))
     except:
         return 0
 
-def get_report_date_for_daily() -> str:
-    return get_attendance_date(beijing_now())
-
-# ================== DataManager ==================
+# ================== DataManager - 并发安全强化 ==================
 class DataManager:
     def __init__(self):
         self._data: dict = {}
@@ -161,34 +230,58 @@ class DataManager:
         return self._data
 
     def _migrate_historical_data(self):
-        print("🔄 开始执行历史数据日期迁移（05:00分界）...")
+        """修复后的迁移逻辑：增强幂等性、安全性、正确处理跨天记录"""
+        print("🔄 开始执行历史数据日期迁移（05:00分界 + Shift4 跨天）...")
         migrated_count = 0
+        changed = False
+        
         for chat_id, chat_data in self._data.items():
             users = chat_data.get("users", {})
             for user_id, user_info in users.items():
                 records = user_info.get("records", {})
-                new_records = {}
-                for old_date, rec_list in records.items():
+                new_records: dict[str, list] = {}
+                
+                for old_date, rec_list in list(records.items()):
                     for rec in rec_list:
                         action = rec.get("action")
                         time_str = rec.get("time", "00:00:00")
+                        
                         try:
+                            # 构造 dummy datetime 用于日期判断
                             rec_time = datetime.strptime(time_str, "%H:%M:%S").time()
                             dummy_dt = datetime.strptime(old_date, "%Y-%m-%d").replace(
-                                hour=rec_time.hour, minute=rec_time.minute, tzinfo=TZ
+                                hour=rec_time.hour, 
+                                minute=rec_time.minute, 
+                                second=rec_time.second,
+                                tzinfo=TZ
                             )
+                            
                             new_date = get_record_date(action, dummy_dt)
+                            
                             if new_date not in new_records:
                                 new_records[new_date] = []
-                            new_records[new_date].append(rec)
-                            if new_date != old_date:
-                                migrated_count += 1
-                        except:
+                            
+                            # 幂等检查：避免重复记录
+                            if not any(
+                                r.get("time") == rec.get("time") and 
+                                r.get("action") == action and
+                                r.get("display") == rec.get("display")
+                                for r in new_records.get(new_date, [])
+                        ):
+                                new_records[new_date].append(rec.copy())
+                                if new_date != old_date:
+                                    migrated_count += 1
+                                    changed = True
+                        except Exception:
+                            # 回退保护
                             if old_date not in new_records:
                                 new_records[old_date] = []
-                            new_records[old_date].append(rec)
+                            new_records[old_date].append(rec.copy())
+                
+                # 原子替换该用户的所有记录
                 user_info["records"] = new_records
-        if migrated_count > 0:
+        
+        if migrated_count > 0 or changed:
             self._dirty = True
             print(f"✅ 历史数据迁移完成，共调整 {migrated_count} 条记录")
         else:
@@ -234,6 +327,7 @@ class DataManager:
             })
 
     async def update_chat_data(self, chat_id: str, chat_data: dict):
+        """强化并发安全的更新"""
         async with self._get_chat_lock(chat_id):
             await self.aload()
             self._data[chat_id] = chat_data
@@ -276,7 +370,7 @@ ACTIONS = {
     "8": {"name": "作业结束回到座位", "time": None, "is_work": False, "type": "work_rest_end"},
 }
 
-# ================== 核心工具函数 ==================
+# ================== 报表生成 ==================
 def build_daily_report_rows(chat_data: dict, report_date: str):
     registered = chat_data.get("registered", {})
     users = chat_data.get("users", {})
@@ -319,31 +413,43 @@ def build_daily_report_rows(chat_data: dict, report_date: str):
             "工作原因总休息分钟": total_work_rest,
             "状态": status,
         })
+    
+    # ================== 新增：按姓名排序 ==================
+    rows.sort(key=lambda x: x["姓名"])
     return rows
-
 
 def build_month_report_rows(chat_data: dict, current_month: str):
     rows = []
     for user_id, user_name in chat_data.get("registered", {}).items():
         user_records = chat_data.get("users", {}).get(user_id, {}).get("records", {})
         for date_str in sorted(d for d in user_records if d.startswith(current_month)):
+            # 直接使用已排序的 daily rows
             daily = build_daily_report_rows(
-                {"registered": {user_id: user_name}, "users": {user_id: user_records}}, date_str)
+                {"registered": {user_id: user_name}, 
+                 "users": {user_id: user_records}}, 
+                date_str)
             rows.extend(daily)
+    
+    # 月报表也按姓名 + 日期排序（更友好）
+    rows.sort(key=lambda x: (x["姓名"], x["日期"]))
     return rows
 
-
 def cleanup_old_excels():
+    """清理3天前的Excel文件"""
     try:
         now = beijing_now()
         for f in os.listdir(EXCEL_FOLDER):
             if f.endswith(".xlsx"):
                 path = os.path.join(EXCEL_FOLDER, f)
-                if (now - datetime.fromtimestamp(os.path.getmtime(path), tz=TZ)).days > 30:
-                    os.remove(path)
+                file_mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=TZ)
+                if (now - file_mtime).days >= 3:
+                    try:
+                        os.remove(path)
+                        print(f"🗑️ 已清理过期Excel: {f}")
+                    except Exception as e:
+                        print(f"清理文件失败 {f}: {e}")
     except Exception as e:
         print(f"清理Excel失败: {e}")
-
 
 # ================== 核心打卡函数 ==================
 async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
@@ -353,8 +459,13 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
 
     await auto_register(update, context)
 
+    # ================== 关键修复：提前获取当前时间 ==================
+    now = beijing_now()                    # ← 只获取一次，放在最前面
+    time_str = now.strftime("%H:%M:%S")
+    date_str = get_record_date(shift, now)
+
     # 检查上下班时间限制
-    valid, msg = is_valid_checkin_time(shift)
+    valid, msg = is_valid_checkin_time(shift, now)
     if not valid:
         await update.message.reply_text(msg)
         return
@@ -367,42 +478,23 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
             return
 
     chat_data = await data_manager.get_chat_data(chat_id_str)
-    now = beijing_now()
-    time_str = now.strftime("%H:%M:%S")
-    date_str = get_record_date(shift, now)
 
     user_data = chat_data["users"].setdefault(user_id, {"name": user.full_name, "records": {}})
     records = user_data["records"].setdefault(date_str, [])
 
-    # ================== 新增：判断当前是否处于上班状态 ==================
-    def is_currently_on_duty(recs):
-        """判断当前是否处于上班状态（有打开的班次未下班）"""
-        on_duty = False
-        for r in recs:
-            act = r.get("action")
-            if act in {"1", "3"}:   # 上班
-                on_duty = True
-            elif act in {"2", "4"}: # 下班
-                on_duty = False
-        return on_duty
-
-    # 检查是否正在休息
+    # ================== 状态判断 ==================
+    is_on_duty = is_currently_on_duty(records)
     is_resting = any(r.get("type") == "rest_start" and "rest_minutes" not in r for r in records)
     is_work_resting = any(r.get("type") == "work_rest_start" and "rest_minutes" not in r for r in records)
 
-    # ================== 修复后的休息/暂离逻辑 ==================
     if shift in ["5", "7"]:
-        if not is_currently_on_duty(records):
+        if not is_on_duty:
             await update.message.reply_text(
                 "⚠️ **当前不在上班状态**，无法开始休息或暂离！\n\n"
                 "请先打上班卡（1 或 3）后再操作。"
             )
             return
-
-    # 5和7必须先打上班卡（1或3）
-    if shift in ["5", "7"]:
-        has_worked = any(r.get("action") in {"1", "3"} for r in records)
-        if not has_worked:
+        if not has_started_work_today(records):
             await update.message.reply_text("⚠️ 必须先打上班卡（1 或 3）才能开始休息/暂离")
             return
 
@@ -420,8 +512,10 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
         await update.message.reply_text(f"⚠️ {date_str} 已打过 {ACTIONS[shift]['name']}")
         return
 
+    # ================== 记录打卡 ==================
     action = ACTIONS.get(shift, {"name": shift, "type": "unknown"})
-    late = get_late_minutes(action.get("time"), shift)
+    late = get_late_minutes(action.get("time"), shift, now)   # ← 已修复：传入 now
+
     display = action["name"]
     rest_min = 0
 
@@ -493,7 +587,6 @@ async def get_group_owner(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         pass
     return None
 
-
 async def is_admin(update: Update) -> bool:
     if update.effective_chat.type == "private":
         return True
@@ -502,7 +595,6 @@ async def is_admin(update: Update) -> bool:
         return member.status in ["administrator", "creator"]
     except:
         return False
-
 
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
@@ -526,7 +618,6 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("✅ 该用户已是管理员")
 
-
 async def del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("⚠️ 仅限管理员使用")
@@ -549,7 +640,6 @@ async def del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ 该用户不是管理员")
 
-
 async def adminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("⚠️ 仅限管理员使用")
@@ -564,7 +654,6 @@ async def adminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, aid in enumerate(chat_data.get("admins", []), 1):
         text += f"{i}. `{aid}`\n"
     await update.message.reply_text(text, parse_mode="Markdown")
-
 
 async def deluser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
@@ -596,17 +685,13 @@ async def deluser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ 未找到该用户")
 
-
 async def delete_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("⚠️ 仅限管理员使用")
         return
     
     if not context.args:
-        await update.message.reply_text(
-            "用法: `/del YYYY-MM-DD`\n示例: `/del 2026-05-23`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("用法: `/del YYYY-MM-DD`", parse_mode="Markdown")
         return
     
     date_to_del = context.args[0].strip()
@@ -644,14 +729,13 @@ async def delete_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-
 # ================== 报表命令 ==================
 async def todayexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         await update.message.reply_text("⚠️ 仅限管理员使用")
         return
     chat_id_str = str(update.effective_chat.id)
-    today = get_report_date_for_daily()
+    today = get_attendance_date(beijing_now())
     chat_data = await data_manager.get_chat_data(chat_id_str)
     rows = build_daily_report_rows(chat_data, today)
 
@@ -666,6 +750,7 @@ async def todayexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with open(filepath, 'rb') as f:
         await update.message.reply_document(f, filename=filename, caption=f"✅ {today} 全群打卡报表")
+    # 文件将在cleanup_old_excels中于3天后自动删除
 
 
 async def monthexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -689,6 +774,7 @@ async def monthexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(filepath, 'rb') as f:
         await update.message.reply_document(f, filename=filename, 
                                           caption=f"✅ {month} 月报表\n共 {len(rows)} 条记录")
+    # 文件将在cleanup_old_excels中于3天后自动删除
 
 
 async def absent(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -696,7 +782,7 @@ async def absent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ 仅限管理员使用")
         return
     chat_id_str = str(update.effective_chat.id)
-    today = get_report_date_for_daily()
+    today = get_attendance_date(beijing_now())
     chat_data = await data_manager.get_chat_data(chat_id_str)
     registered = chat_data.get("registered", {})
     users = chat_data.get("users", {})
@@ -715,52 +801,97 @@ async def absent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "\n".join(f"{i+1}. {item}" for i, item in enumerate(incomplete))
         await update.message.reply_text(text, parse_mode="Markdown")
 
-
+# ================== 自动日报 ==================
 async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    """每日05:30自动发送前一天的完整打卡报表 - 优化版"""
     cleanup_old_excels()
     report_date = get_report_date_for_daily()
+    print(f"📊 开始生成自动日报 | 日期: {report_date}")
 
-    data = await data_manager.aload(force=True)
-    for chat_id_str, chat_data in data.items():
+    # 加载一次数据，后续直接使用（避免反复读写）
+    all_data = await data_manager.aload(force=True)
+    
+    success_count = 0
+    fail_count = 0
+    total_groups = len(all_data)
+
+    for chat_id_str, chat_data in all_data.items():
         chat_id = int(chat_id_str)
+        
+        # 获取接收人（群主 + 指定管理员）
         recipients = set()
         owner = await get_group_owner(context, chat_id)
-        if owner: 
+        if owner:
             recipients.add(owner)
         recipients.update(int(uid) for uid in chat_data.get("admins", []))
 
-        if not recipients: 
+        if not recipients:
+            print(f"ℹ️ 群 {chat_id} 没有配置接收人，跳过")
             continue
 
-        rows = build_daily_report_rows(chat_data, report_date)
-        filename = f"全群打卡日报_{report_date}.xlsx"
-        filepath = os.path.join(EXCEL_FOLDER, filename)
+        try:
+            # 使用最新数据
+            fresh_chat_data = await data_manager.get_chat_data(chat_id_str)
+            rows = build_daily_report_rows(fresh_chat_data, report_date)
 
-        cols = ["姓名","日期","第一班上班","第一班下班","第二班上班","第二班下班",
-                "第一班迟到","第二班迟到","休息次数","总休息分钟",
-                "工作原因休息次数","工作原因总休息分钟","状态"]
-        df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
-        df.to_excel(filepath, index=False)
+            # === 每个群使用独立文件名，避免覆盖 ===
+            filename = f"全群打卡日报_{report_date}_{chat_id_str}.xlsx"
+            filepath = os.path.join(EXCEL_FOLDER, filename)
 
-        caption = f"📊 **{report_date} 全群日报**\n👥 总注册: {len(rows)} 人"
-        for rid in recipients:
-            try:
-                with open(filepath, 'rb') as f:
-                    await context.bot.send_document(rid, f, filename=filename, caption=caption, parse_mode="Markdown")
-            except Exception as e:
-                print(f"发送日报失败 {rid}: {e}")
+            cols = ["姓名","日期","第一班上班","第一班下班","第二班上班","第二班下班",
+                    "第一班迟到","第二班迟到","休息次数","总休息分钟",
+                    "工作原因休息次数","工作原因总休息分钟","状态"]
+            
+            df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+            df.to_excel(filepath, index=False)
 
+            caption = f"📊 **{report_date} 全群日报**（05:00~次日05:00）\n" \
+                      f"👥 总注册: {len(rows)} 人 | 群ID: {chat_id_str}"
+
+            # 发送给所有接收人
+            sent_to = 0
+            for rid in recipients:
+                for attempt in range(3):
+                    try:
+                        with open(filepath, 'rb') as f:
+                            await context.bot.send_document(
+                                rid, 
+                                f, 
+                                filename=filename.replace(f"_{chat_id_str}", ""),  # 发送给用户时不带群ID
+                                caption=caption, 
+                                parse_mode="Markdown"
+                            )
+                        sent_to += 1
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        else:
+                            print(f"❌ 发送失败 [群{chat_id}] 用户{rid}: {e}")
+
+            if sent_to > 0:
+                success_count += 1
+                print(f"✅ 群 {chat_id} 日报发送成功（{sent_to}/{len(recipients)} 人）")
+            else:
+                fail_count += 1
+
+        except Exception as e:
+            fail_count += 1
+            print(f"❌ 处理群 {chat_id} 日报时发生异常: {e}")
+
+    print(f"📨 自动日报任务完成 | 群组: {success_count}/{total_groups} | 失败: {fail_count} | 日期: {report_date}")
 
 # ================== 其他命令 ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "飞机的代号确定下来了就不要再改了，否则会打卡记录失败\n\n"
         "第一班上班打1，下班打2。第二班上班打3，下班打4，离开工位休息打5，回来打6。\n\n"
-        "上下班打卡的，迟到早退相同，10分钟内扣50，1小时内扣100，1小时外按旷工扣200.\n"
-        "休息（5/7）仅限工作时段内，且必须先打上班卡。\n\n"
+        "上下班打卡的，迟到早退相同，10分钟内扣50，1小时内扣100，1小时外按旷工扣200.超过1秒也算迟到跟早退。漏打每次100（下班打卡有效时间1小时）.\n"
+        "严禁互相打卡与飞机定时发送。互相打卡两个人各扣300，定时发送扣600.\n"
+        "如果遇到没有信号的缘故，或者帮公司做其他事情没办法及时打卡的，找公司组长或副组长证明补打卡后原因写上。其余不管是加班聊客户或者其他原因的也算迟到早退。\n\n"
         "私聊机器人发送 /myrecord 可查询个人记录\n"
     )
-
 
 async def registered_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id_str = str(update.effective_chat.id)
@@ -773,7 +904,6 @@ async def registered_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, (uid, name) in enumerate(registered.items(), 1):
         text += f"{i}. {name} (`{uid}`)\n"
     await update.message.reply_text(text, parse_mode="Markdown")
-
 
 async def myrecord(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -798,13 +928,14 @@ async def myrecord(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += "\n"
     await update.message.reply_text(text if found else "暂无记录", parse_mode="Markdown")
 
-
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = beijing_now()
     att_date = get_attendance_date(now)
+    report_date = get_report_date_for_daily()
     await update.message.reply_text(
         f"🕒 当前北京时间：**{now.strftime('%Y-%m-%d %H:%M:%S')}**\n"
-        f"📅 当前考勤日期：**{att_date}**",
+        f"📅 当前考勤日期：**{att_date}**\n"
+        f"📊 今日05:30将发送的日报日期：**{report_date}**",
         parse_mode="Markdown"
     )
 
@@ -812,11 +943,19 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     data_manager.load(force=True)
     
-    app = Application.builder().token(TOKEN).build()
+    # ================== 关键修复：设置默认时区 ==================
+    from telegram.ext import Defaults
+    
+    app = Application.builder() \
+        .token(TOKEN) \
+        .defaults(Defaults(tzinfo=TZ)) \
+        .build()
+    
     jq: JobQueue = app.job_queue
 
-    jq.run_daily(data_manager.cleanup_old_data, time(6, 10, 0, tzinfo=TZ))
-    jq.run_daily(send_daily_report, time(5, 30, 0, tzinfo=TZ))
+    # ================== JobQueue 使用不带 tzinfo 的 time ==================
+    jq.run_daily(send_daily_report, time(5, 30, 0))      # 每日 05:30 发送前一天日报
+    jq.run_daily(data_manager.cleanup_old_data, time(6, 10, 0))  # 每日 06:10 清理旧数据
 
     handlers = [
         CommandHandler("start", start),
@@ -838,7 +977,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🚀 打卡机器人已完全启动（啊原的第4个版本。0.4.6）")
+    print("🚀 打卡机器人已完全启动（啊原的第5个版本 - 5.6 修复版）")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
