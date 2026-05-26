@@ -390,15 +390,24 @@ def build_daily_report_rows(chat_data: dict, report_date: str):
 
         shifts = {r.get("action"): r for r in records if r.get("action") in {"1", "2", "3", "4"}}
 
-        # 修正后的休息统计
-        total_rest = sum(r.get("rest_minutes", 0) 
-                        for r in records if r.get("type") == "rest_end")
-        rest_count = sum(1 for r in records if r.get("type") == "rest_end")
+        # ================== 修复后的休息统计 ==================
+        total_rest = 0
+        rest_count = 0
+        total_work_rest = 0
+        work_rest_count = 0
 
-        total_work_rest = sum(r.get("rest_minutes", 0) 
-                             for r in records if r.get("type") == "work_rest_end")
-        work_rest_count = sum(1 for r in records if r.get("type") == "work_rest_end")
+        for r in records:
+            if r.get("rest_minutes"):
+                minutes = r.get("rest_minutes", 0)
+                rtype = r.get("type")
+                if rtype == "rest_start":          # 普通休息（5-6）
+                    total_rest += minutes
+                    rest_count += 1
+                elif rtype == "work_rest_start":   # 工作原因暂离（7-8）
+                    total_work_rest += minutes
+                    work_rest_count += 1
 
+        # ================== 迟到等其他逻辑保持不变 ==================
         late1 = shifts.get("1", {}).get("late_min", 0)
         late2 = shifts.get("3", {}).get("late_min", 0)
 
@@ -975,7 +984,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🚀 打卡机器人已完全启动（啊原的第5个版本 - 5.8）")
+    print("🚀 打卡机器人已完全启动（啊原的第5个版本 - 5.9）")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
