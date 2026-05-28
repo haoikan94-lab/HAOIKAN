@@ -943,9 +943,9 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     data_manager.load(force=True)
     
-    app = Application.builder() \
-        .token(TOKEN) \
-        .defaults(Defaults(tzinfo=TZ)) \
+    app = Application.builder() 
+        .token(TOKEN) 
+        .defaults(Defaults(tzinfo=TZ)) 
         .build()
     
     jq: JobQueue = app.job_queue
