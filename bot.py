@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, time
 import pandas as pd
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue, Defaults
 from zoneinfo import ZoneInfo
 import time as time_module
 import shutil
@@ -35,7 +35,7 @@ def beijing_date_str(dt=None):
         dt = beijing_now()
     return dt.strftime("%Y-%m-%d")
 
-# ================== 新日期边界逻辑：05:00 为分界点 ==================
+# ================== 日期边界逻辑 ==================
 def get_attendance_date(now=None):
     """获取考勤所属日期（05:00 之后为当天）"""
     if now is None:
@@ -45,19 +45,14 @@ def get_attendance_date(now=None):
     return beijing_date_str(now)
 
 def get_record_date(shift: str, now=None) -> str:
-    """根据打卡类型获取正确的记录日期 - 已修复 Shift 4 跨天逻辑"""
+    """根据打卡类型获取正确的记录日期"""
     if now is None:
         now = beijing_now()
-    
     base_date = get_attendance_date(now)
-    
-    # Shift 4（第二班下班）在 05:00 之前打卡时，始终属于前一天
     if shift == "4" and now.hour < 5:
         return beijing_date_str(now - timedelta(days=1))
-    
     return base_date
 
-# ================== 前一天考勤日期（用于05:30自动日报） ==================
 def get_previous_attendance_date(now=None) -> str:
     if now is None:
         now = beijing_now()
@@ -74,7 +69,6 @@ def is_valid_checkin_time(shift: str, now: datetime = None) -> tuple[bool, str]:
     
     if now is None:
         now = beijing_now()
-    
     current_time = now.time()
     
     if shift == "1":      # 第一班上班
@@ -99,9 +93,7 @@ def is_valid_rest_time(shift: str) -> tuple[bool, str]:
     now = beijing_now()
     current_time = now.time()
     
-    if time(14, 0) <= current_time < time(19, 0):
-        return True, ""
-    if current_time >= time(21, 0) or current_time < time(5, 0):
+    if time(14, 0) <= current_time < time(19, 0) or current_time >= time(21, 0) or current_time < time(5, 0):
         return True, ""
     
     return False, "⚠️ 休息/暂离（5或7）只能在以下工作时段打卡：\n• 第一班 14:00-19:00\n• 第二班 21:00-05:00"
@@ -112,25 +104,20 @@ def calculate_rest_duration(start_time_str: str, end_time_str: str) -> int:
         fmt = "%H:%M:%S"
         start = datetime.strptime(start_time_str, fmt)
         end = datetime.strptime(end_time_str, fmt)
-        
         if end < start:
             end += timedelta(days=1)
-        
         delta = end - start
         return int(delta.total_seconds() / 60)
     except Exception as e:
         print(f"⚠️ 计算休息时长失败: {e}")
         return 0
 
-
 # ================== 状态判断工具函数 ==================
 def is_currently_on_duty(records: list) -> bool:
     if not records:
         return False
-
     shift1_active = False
     shift2_active = False
-
     for r in records:
         act = r.get("action")
         if act == "1":
@@ -141,9 +128,7 @@ def is_currently_on_duty(records: list) -> bool:
             shift2_active = True
         elif act == "4":
             shift2_active = False
-
     return shift1_active or shift2_active
-
 
 def has_started_work_today(records: list) -> bool:
     """当天是否至少打过一次上班卡"""
@@ -152,10 +137,8 @@ def has_started_work_today(records: list) -> bool:
 def get_late_minutes(expected: str, shift: str = None, now: datetime = None) -> int:
     if not expected or shift not in {"1", "3"}:
         return 0
-    
     if now is None:
         now = beijing_now()
-    
     try:
         exp_hm = datetime.strptime(expected, "%H:%M").time()
         expected_dt = now.replace(hour=exp_hm.hour, minute=exp_hm.minute, 
@@ -164,8 +147,7 @@ def get_late_minutes(expected: str, shift: str = None, now: datetime = None) -> 
     except:
         return 0
 
-
-# ================== DataManager - 并发安全强化 ==================
+# ================== DataManager ==================
 class DataManager:
     def __init__(self):
         self._data: dict = {}
@@ -225,7 +207,6 @@ class DataManager:
                     for rec in rec_list:
                         action = rec.get("action")
                         time_str = rec.get("time", "00:00:00")
-                        
                         try:
                             rec_time = datetime.strptime(time_str, "%H:%M:%S").time()
                             dummy_dt = datetime.strptime(old_date, "%Y-%m-%d").replace(
@@ -241,7 +222,7 @@ class DataManager:
                                 r.get("time") == rec.get("time") and 
                                 r.get("action") == action and
                                 r.get("display") == rec.get("display")
-                                for r in new_records.get(new_date, [])
+                                for r in new_records.get(new_date, []):
                             ):
                                 new_records[new_date].append(rec.copy())
                                 if new_date != old_date:
@@ -342,9 +323,8 @@ ACTIONS = {
     "8": {"name": "作业结束回到座位", "time": None, "is_work": False, "type": "work_rest_end"},
 }
 
-# ================== 休息超时提醒（新增功能） ==================
+# ================== 休息超时提醒 ==================
 async def check_rest_timeout(context: ContextTypes.DEFAULT_TYPE):
-    """检查用户休息是否超时未结束（仅针对打5未打6）"""
     job_data = context.job.data
     chat_id = job_data["chat_id"]
     user_id = job_data["user_id"]
@@ -353,7 +333,6 @@ async def check_rest_timeout(context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_data = await data_manager.get_chat_data(str(chat_id))
         user_records = chat_data.get("users", {}).get(user_id, {}).get("records", {})
-        
         today = get_attendance_date(beijing_now())
         records = user_records.get(today, [])
         
@@ -362,21 +341,25 @@ async def check_rest_timeout(context: ContextTypes.DEFAULT_TYPE):
             for r in records
         )
         
-        if still_resting:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"⚠️ **休息超时提醒**\n\n"
-                     f"您已在 **{start_time}** 开始休息，\n"
-                     f"已超过 **60分钟** 仍未结束休息（未打6）。\n\n"
-                     f"请尽快回复 **6** 结束休息。",
-                parse_mode="Markdown"
-            )
-            print(f"✅ 已发送休息超时提醒给用户 {user_id}")
-        else:
-            print(f"ℹ️ 用户 {user_id} 休息已结束，无需提醒")
-    except Exception as e:
-        print(f"❌ 休息提醒任务执行失败 (用户{user_id}): {e}")
+        if not still_resting:
+            return
 
+        user_name = chat_data.get("registered", {}).get(user_id, "用户")
+        reminder_text = (
+            f"⚠️ **休息超时提醒**\n\n"
+            f"👤 {user_name}\n"
+            f"🕒 您已在 **{start_time}** 开始休息，\n"
+            f"已超过 **60分钟** 仍未结束休息（未打6）。\n\n"
+            f"请尽快回复 **6** 结束休息！"
+        )
+
+        try:
+            await context.bot.send_message(chat_id=user_id, text=reminder_text, parse_mode="Markdown")
+            return
+        except:
+            await context.bot.send_message(chat_id=chat_id, text=reminder_text, parse_mode="Markdown")
+    except Exception as e:
+        print(f"❌ 休息提醒任务执行异常: {e}")
 
 # ================== 报表生成 ==================
 def build_daily_report_rows(chat_data: dict, report_date: str):
@@ -390,49 +373,36 @@ def build_daily_report_rows(chat_data: dict, report_date: str):
 
         shifts = {r.get("action"): r for r in records if r.get("action") in {"1", "2", "3", "4"}}
 
-        # ================== 修复后的休息统计 ==================
-        total_rest = 0
-        rest_count = 0
-        total_work_rest = 0
-        work_rest_count = 0
-
+        total_rest = rest_count = total_work_rest = work_rest_count = 0
         for r in records:
             if r.get("rest_minutes"):
                 minutes = r.get("rest_minutes", 0)
-                rtype = r.get("type")
-                if rtype == "rest_start":          # 普通休息（5-6）
+                if r.get("type") == "rest_start":
                     total_rest += minutes
                     rest_count += 1
-                elif rtype == "work_rest_start":   # 工作原因暂离（7-8）
+                elif r.get("type") == "work_rest_start":
                     total_work_rest += minutes
                     work_rest_count += 1
 
-        # ================== 迟到等其他逻辑保持不变 ==================
         late1 = shifts.get("1", {}).get("late_min", 0)
         late2 = shifts.get("3", {}).get("late_min", 0)
-
         missing = set('1234') - set(shifts.keys())
         status = "正常" if not missing else f"缺卡: {','.join(sorted(missing))}"
 
         rows.append({
-            "姓名": user_name,
-            "日期": report_date,
+            "姓名": user_name, "日期": report_date,
             "第一班上班": shifts.get("1", {}).get("time", "缺卡"),
             "第一班下班": shifts.get("2", {}).get("time", "缺卡"),
             "第二班上班": shifts.get("3", {}).get("time", "缺卡"),
             "第二班下班": shifts.get("4", {}).get("time", "缺卡"),
-            "第一班迟到": late1,
-            "第二班迟到": late2,
-            "休息次数": rest_count,
-            "总休息分钟": total_rest,
-            "工作原因休息次数": work_rest_count,
-            "工作原因总休息分钟": total_work_rest,
+            "第一班迟到": late1, "第二班迟到": late2,
+            "休息次数": rest_count, "总休息分钟": total_rest,
+            "工作原因休息次数": work_rest_count, "工作原因总休息分钟": total_work_rest,
             "状态": status,
         })
     
     rows.sort(key=lambda x: x["姓名"])
     return rows
-
 
 def build_month_report_rows(chat_data: dict, current_month: str):
     rows = []
@@ -440,17 +410,13 @@ def build_month_report_rows(chat_data: dict, current_month: str):
         user_records = chat_data.get("users", {}).get(user_id, {}).get("records", {})
         for date_str in sorted(d for d in user_records if d.startswith(current_month)):
             daily = build_daily_report_rows(
-                {"registered": {user_id: user_name}, 
-                 "users": {user_id: user_records}}, 
+                {"registered": {user_id: user_name}, "users": {user_id: user_records}}, 
                 date_str)
             rows.extend(daily)
-    
     rows.sort(key=lambda x: (x["姓名"], x["日期"]))
     return rows
 
-
 def cleanup_old_excels():
-    """清理3天前的Excel文件"""
     try:
         now = beijing_now()
         for f in os.listdir(EXCEL_FOLDER):
@@ -458,14 +424,10 @@ def cleanup_old_excels():
                 path = os.path.join(EXCEL_FOLDER, f)
                 file_mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=TZ)
                 if (now - file_mtime).days >= 3:
-                    try:
-                        os.remove(path)
-                        print(f"🗑️ 已清理过期Excel: {f}")
-                    except Exception as e:
-                        print(f"清理文件失败 {f}: {e}")
+                    os.remove(path)
+                    print(f"🗑️ 已清理过期Excel: {f}")
     except Exception as e:
         print(f"清理Excel失败: {e}")
-
 
 # ================== 核心打卡函数 ==================
 async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
@@ -491,7 +453,6 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
             return
 
     chat_data = await data_manager.get_chat_data(chat_id_str)
-
     user_data = chat_data["users"].setdefault(user_id, {"name": user.full_name, "records": {}})
     records = user_data["records"].setdefault(date_str, [])
 
@@ -501,10 +462,7 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
 
     if shift in ["5", "7"]:
         if not is_on_duty:
-            await update.message.reply_text(
-                "⚠️ **当前不在上班状态**，无法开始休息或暂离！\n\n"
-                "请先打上班卡（1 或 3）后再操作。"
-            )
+            await update.message.reply_text("⚠️ **当前不在上班状态**，无法开始休息或暂离！\n\n请先打上班卡（1 或 3）后再操作。")
             return
         if not has_started_work_today(records):
             await update.message.reply_text("⚠️ 必须先打上班卡（1 或 3）才能开始休息/暂离")
@@ -524,7 +482,6 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
         await update.message.reply_text(f"⚠️ {date_str} 已打过 {ACTIONS[shift]['name']}")
         return
 
-    # ================== 记录打卡 ==================
     action = ACTIONS.get(shift, {"name": shift, "type": "unknown"})
     late = get_late_minutes(action.get("time"), shift, now)
 
@@ -548,20 +505,14 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
         "type": action.get("type")
     })
 
-    # ================== 新增：5号休息60分钟未结束提醒 ==================
     if shift == "5":
         job_name = f"rest_timeout_{chat_id_str}_{user_id}_{time_str}"
         context.job_queue.run_once(
             callback=check_rest_timeout,
-            when=3600,                    # 60分钟
-            data={
-                "chat_id": int(chat_id_str),
-                "user_id": user_id,
-                "start_time": time_str
-            },
+            when=3600,
+            data={"chat_id": int(chat_id_str), "user_id": user_id, "start_time": time_str},
             name=job_name
         )
-        print(f"⏰ 已为用户 {user_id} 启动休息60分钟提醒任务")
 
     await data_manager.update_chat_data(chat_id_str, chat_data)
 
@@ -571,7 +522,6 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
         f"{emoji} **{user.full_name}** {display}{late_txt}\n日期：{date_str}\n时间：{time_str}",
         parse_mode="Markdown"
     )
-
 
 # ================== 消息处理 ==================
 async def text_daka(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -589,7 +539,6 @@ async def text_daka(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in mapping:
         await daka(update, context, mapping[text])
 
-
 async def auto_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id_str = str(update.effective_chat.id)
     user_id = str(update.effective_user.id)
@@ -602,9 +551,9 @@ async def auto_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await data_manager.update_chat_data(chat_id_str, chat_data)
         await update.message.reply_text(f"✅ **{name}** 自动注册成功！", parse_mode="Markdown")
 
-
-# ================== 管理员命令 ==================
+# ================== 管理员权限相关 ==================
 async def get_group_owner(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """获取群主ID"""
     try:
         admins = await context.bot.get_chat_administrators(chat_id)
         for a in admins:
@@ -614,107 +563,151 @@ async def get_group_owner(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         pass
     return None
 
-async def is_admin(update: Update) -> bool:
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE = None) -> bool:
+    """统一管理员判断：Telegram原生管理员 + 自定义管理员"""
     if update.effective_chat.type == "private":
         return True
+    user_id = str(update.effective_user.id)
+    chat_id_str = str(update.effective_chat.id)
+
     try:
         member = await update.effective_chat.get_member(update.effective_user.id)
-        return member.status in ["administrator", "creator"]
+        if member.status in ["administrator", "creator"]:
+            return True
     except:
-        return False
+        pass
 
+    if context is not None:
+        chat_data = await data_manager.get_chat_data(chat_id_str)
+        return user_id in chat_data.get("admins", [])
+    return False
+
+async def is_group_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """严格判断是否为群主"""
+    if update.effective_chat.type == "private":
+        return True
+    owner_id = await get_group_owner(context, update.effective_chat.id)
+    return owner_id == update.effective_user.id
+
+# ================== 管理员命令 ==================
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ 仅限管理员使用")
+    if not await is_admin(update, context):
+        await update.message.reply_text("⚠️ 仅限群管理员使用")
         return
-    chat_id_str = str(update.effective_chat.id)
-    owner = await get_group_owner(context, int(chat_id_str))
-    if owner and owner != update.effective_user.id:
-        await update.message.reply_text("⚠️ 仅群主可操作管理员")
+    if not await is_group_owner(update, context):
+        await update.message.reply_text("⚠️ **仅群主**可添加/删除管理员")
         return
+
     if not context.args:
-        await update.message.reply_text("用法: /addadmin <用户ID>")
+        await update.message.reply_text("用法: `/addadmin <用户ID>`\n例如: `/addadmin 123456789`", parse_mode="Markdown")
         return
+
     target = context.args[0].strip()
+    if not target.isdigit():
+        await update.message.reply_text("❌ 用户ID必须为纯数字")
+        return
+
+    chat_id_str = str(update.effective_chat.id)
     chat_data = await data_manager.get_chat_data(chat_id_str)
-    if target not in chat_data["admins"]:
-        chat_data["admins"].append(target)
-        await data_manager.update_chat_data(chat_id_str, chat_data)
-        await data_manager.force_save()
-        await update.message.reply_text(f"✅ 已添加管理员 `{target}`", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("✅ 该用户已是管理员")
+
+    if target in chat_data.get("admins", []):
+        await update.message.reply_text(f"✅ 用户 `{target}` 已经是管理员", parse_mode="Markdown")
+        return
+
+    chat_data.setdefault("admins", []).append(target)
+    await data_manager.update_chat_data(chat_id_str, chat_data)
+    await data_manager.force_save()
+
+    await update.message.reply_text(f"✅ **成功添加管理员**\n👤 用户ID: `{target}`", parse_mode="Markdown")
+
 
 async def del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ 仅限管理员使用")
+    if not await is_admin(update, context):
+        await update.message.reply_text("⚠️ 仅限群管理员使用")
         return
-    chat_id_str = str(update.effective_chat.id)
-    owner = await get_group_owner(context, int(chat_id_str))
-    if owner and owner != update.effective_user.id:
-        await update.message.reply_text("⚠️ 仅群主可操作管理员")
+    if not await is_group_owner(update, context):
+        await update.message.reply_text("⚠️ **仅群主**可添加/删除管理员")
         return
+
     if not context.args:
-        await update.message.reply_text("用法: /deladmin <用户ID>")
+        await update.message.reply_text("用法: `/deladmin <用户ID>`", parse_mode="Markdown")
         return
+
     target = context.args[0].strip()
+    chat_id_str = str(update.effective_chat.id)
     chat_data = await data_manager.get_chat_data(chat_id_str)
-    if target in chat_data["admins"]:
-        chat_data["admins"].remove(target)
-        await data_manager.update_chat_data(chat_id_str, chat_data)
-        await data_manager.force_save()
-        await update.message.reply_text(f"✅ 已删除管理员 `{target}`", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("❌ 该用户不是管理员")
+
+    if target not in chat_data.get("admins", []):
+        await update.message.reply_text(f"❌ 用户 `{target}` 不是管理员", parse_mode="Markdown")
+        return
+
+    chat_data["admins"].remove(target)
+    await data_manager.update_chat_data(chat_id_str, chat_data)
+    await data_manager.force_save()
+
+    await update.message.reply_text(f"✅ **成功删除管理员**\n👤 用户ID: `{target}`", parse_mode="Markdown")
+
 
 async def adminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ 仅限管理员使用")
+    if not await is_admin(update, context):
+        await update.message.reply_text("⚠️ 仅限群管理员使用")
         return
+
     chat_id_str = str(update.effective_chat.id)
     chat_data = await data_manager.get_chat_data(chat_id_str)
-    owner = await get_group_owner(context, int(chat_id_str))
-    text = "📋 **日报表接收人**\n\n"
-    if owner:
-        text += f"👑 群主: `{owner}`\n"
-    text += f"📌 指定管理员 ({len(chat_data.get('admins',[]))}人):\n"
-    for i, aid in enumerate(chat_data.get("admins", []), 1):
+    owner_id = await get_group_owner(context, int(chat_id_str))
+
+    text = "📋 **群管理员列表**\n\n"
+    if owner_id:
+        text += f"👑 群主: `{owner_id}`\n\n"
+    
+    admins = chat_data.get("admins", [])
+    text += f"📌 指定管理员（{len(admins)}人）:\n"
+    for i, aid in enumerate(admins, 1):
         text += f"{i}. `{aid}`\n"
+    if not admins:
+        text += "暂无指定管理员\n"
+
+    text += f"\n💡 当前操作者: {'👑 群主' if await is_group_owner(update, context) else '管理员'}"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def deluser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ 仅限管理员使用")
+    if not await is_admin(update, context):
+        await update.message.reply_text("⚠️ 仅限群管理员使用")
         return
+
     if not context.args:
-        await update.message.reply_text("用法: /deluser <用户ID 或 @用户名>")
+        await update.message.reply_text("用法: `/deluser <用户ID 或 @用户名>`", parse_mode="Markdown")
         return
-    chat_id_str = str(update.effective_chat.id)
+
     target = context.args[0].strip()
+    chat_id_str = str(update.effective_chat.id)
     chat_data = await data_manager.get_chat_data(chat_id_str)
     target_id = None
 
     if target.startswith('@'):
         name_search = target[1:].lower()
-        for uid, name in chat_data["registered"].items():
+        for uid, name in chat_data.get("registered", {}).items():
             if name.lower() == name_search:
                 target_id = uid
                 break
-    elif target in chat_data["registered"]:
+    elif target in chat_data.get("registered", {}):
         target_id = target
 
-    if target_id and target_id in chat_data["registered"]:
+    if target_id and target_id in chat_data.get("registered", {}):
         name = chat_data["registered"].pop(target_id)
-        chat_data["users"].pop(target_id, None)
+        chat_data.get("users", {}).pop(target_id, None)
         await data_manager.update_chat_data(chat_id_str, chat_data)
         await data_manager.force_save()
-        await update.message.reply_text(f"✅ 已删除用户：**{name}**", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ 已删除用户：**{name}** (`{target_id}`)", parse_mode="Markdown")
     else:
-        await update.message.reply_text("❌ 未找到该用户")
+        await update.message.reply_text("❌ 未找到该用户", parse_mode="Markdown")
+
 
 async def delete_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        await update.message.reply_text("⚠️ 仅限管理员使用")
+    if not await is_admin(update, context):
+        await update.message.reply_text("⚠️ 仅限群管理员使用")
         return
     
     if not context.args:
@@ -752,13 +745,16 @@ async def delete_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_list += f" 等共 {len(affected_users)} 人"
     
     await update.message.reply_text(
-        f"✅ **删除成功**\n\n📅 日期：**{date_to_del}**\n👥 影响用户：**{count}** 人\n用户：{user_list}",
+        f"✅ **删除成功**\n\n"
+        f"📅 日期：**{date_to_del}**\n"
+        f"👥 影响用户：**{count}** 人\n"
+        f"用户：{user_list}",
         parse_mode="Markdown"
     )
 
 # ================== 报表命令 ==================
 async def todayexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
+    if not await is_admin(update, context):
         await update.message.reply_text("⚠️ 仅限管理员使用")
         return
     chat_id_str = str(update.effective_chat.id)
@@ -780,7 +776,7 @@ async def todayexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def monthexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
+    if not await is_admin(update, context):
         await update.message.reply_text("⚠️ 仅限管理员使用")
         return
     chat_id_str = str(update.effective_chat.id)
@@ -803,7 +799,7 @@ async def monthexcel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def absent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
+    if not await is_admin(update, context):
         await update.message.reply_text("⚠️ 仅限管理员使用")
         return
     chat_id_str = str(update.effective_chat.id)
@@ -826,7 +822,6 @@ async def absent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "\n".join(f"{i+1}. {item}" for i, item in enumerate(incomplete))
         await update.message.reply_text(text, parse_mode="Markdown")
 
-
 # ================== 自动日报 ==================
 async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
     cleanup_old_excels()
@@ -834,9 +829,7 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
     print(f"📊 开始生成自动日报 | 日期: {report_date}")
 
     all_data = await data_manager.aload(force=True)
-    
     success_count = 0
-    fail_count = 0
     total_groups = len(all_data)
 
     for chat_id_str, chat_data in all_data.items():
@@ -885,11 +878,9 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
             if sent_to > 0:
                 success_count += 1
         except Exception as e:
-            fail_count += 1
             print(f"处理群 {chat_id} 日报异常: {e}")
 
     print(f"📨 自动日报任务完成 | 成功: {success_count}/{total_groups}")
-
 
 # ================== 其他命令 ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -952,8 +943,6 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     data_manager.load(force=True)
     
-    from telegram.ext import Defaults
-    
     app = Application.builder() \
         .token(TOKEN) \
         .defaults(Defaults(tzinfo=TZ)) \
@@ -966,7 +955,7 @@ def main():
 
     handlers = [
         CommandHandler("start", start),
-        CommandHandler("register", lambda u,c: auto_register(u,c)),
+        CommandHandler("register", auto_register),
         CommandHandler("registered", registered_list),
         CommandHandler("myrecord", myrecord),
         CommandHandler("addadmin", add_admin),
@@ -984,7 +973,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🚀 打卡机器人已完全启动（啊原的第5个版本 - 5.9）")
+    print("🚀 打卡机器人已完全启动（啊原的第6个版本 - ）")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
