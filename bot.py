@@ -583,69 +583,109 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE = None) ->
     return False
 
 async def is_group_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """严格判断是否为群主"""
     if update.effective_chat.type == "private":
         return True
-    owner_id = await get_group_owner(context, update.effective_chat.id)
-    return owner_id == update.effective_user.id
+    try:
+        admins = await context.bot.get_chat_administrators(update.effective_chat.id)
+        for a in admins:
+            if a.status == "creator" and a.user.id == update.effective_user.id:
+                return True
+        return False
+    except Exception as e:
+        print(f"获取群主信息失败: {e}")
+        return False  # 失败时保守处理
 
 # ================== 管理员命令 ==================
+
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("⚠️ 仅限群管理员使用")
-        return
-    if not await is_group_owner(update, context):
-        await update.message.reply_text("⚠️ **仅群主**可添加/删除管理员")
-        return
+    """添加管理员（仅群主可用）"""
+    try:
+        if not await is_group_owner(update, context):
+            await update.message.reply_text("⚠️ **仅群主**可添加/删除管理员")
+            return
 
-    if not context.args:
-        await update.message.reply_text("用法: `/addadmin <用户ID>`\n例如: `/addadmin 123456789`", parse_mode="Markdown")
-        return
+        if not context.args:
+            await update.message.reply_text(
+                "📌 用法：`/addadmin <用户ID>`\n"
+                "例如：`/addadmin 123456789`", 
+                parse_mode="Markdown"
+            )
+            return
 
-    target = context.args[0].strip()
-    if not target.isdigit():
-        await update.message.reply_text("❌ 用户ID必须为纯数字")
-        return
+        target = context.args[0].strip()
+        
+        if not target.isdigit():
+            await update.message.reply_text("❌ 用户ID必须为纯数字")
+            return
 
-    chat_id_str = str(update.effective_chat.id)
-    chat_data = await data_manager.get_chat_data(chat_id_str)
+        chat_id_str = str(update.effective_chat.id)
+        chat_data = await data_manager.get_chat_data(chat_id_str)
 
-    if target in chat_data.get("admins", []):
-        await update.message.reply_text(f"✅ 用户 `{target}` 已经是管理员", parse_mode="Markdown")
-        return
+        if target in chat_data.get("admins", []):
+            await update.message.reply_text(
+                f"✅ 用户 `{target}` 已经是管理员", 
+                parse_mode="Markdown"
+            )
+            return
 
-    chat_data.setdefault("admins", []).append(target)
-    await data_manager.update_chat_data(chat_id_str, chat_data)
-    await data_manager.force_save()
+        if "admins" not in chat_data:
+            chat_data["admins"] = []
+        
+        chat_data["admins"].append(target)
+        
+        await data_manager.update_chat_data(chat_id_str, chat_data)
+        await data_manager.force_save()
 
-    await update.message.reply_text(f"✅ **成功添加管理员**\n👤 用户ID: `{target}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ **成功添加管理员**\n\n"
+            f"👤 用户ID：`{target}`\n"
+            f"💡 该用户现在拥有管理员权限", 
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        print(f"❌ [add_admin] 执行异常: {e}")
+        await update.message.reply_text("❌ 添加管理员时发生错误，请稍后重试")
 
 
 async def del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("⚠️ 仅限群管理员使用")
-        return
-    if not await is_group_owner(update, context):
-        await update.message.reply_text("⚠️ **仅群主**可添加/删除管理员")
-        return
+    """删除管理员（仅群主可用）"""
+    try:
+        if not await is_group_owner(update, context):
+            await update.message.reply_text("⚠️ **仅群主**可添加/删除管理员")
+            return
 
-    if not context.args:
-        await update.message.reply_text("用法: `/deladmin <用户ID>`", parse_mode="Markdown")
-        return
+        if not context.args:
+            await update.message.reply_text(
+                "📌 用法：`/deladmin <用户ID>`\n"
+                "例如：`/deladmin 123456789`", 
+                parse_mode="Markdown"
+            )
+            return
 
-    target = context.args[0].strip()
-    chat_id_str = str(update.effective_chat.id)
-    chat_data = await data_manager.get_chat_data(chat_id_str)
+        target = context.args[0].strip()
+        chat_id_str = str(update.effective_chat.id)
+        chat_data = await data_manager.get_chat_data(chat_id_str)
 
-    if target not in chat_data.get("admins", []):
-        await update.message.reply_text(f"❌ 用户 `{target}` 不是管理员", parse_mode="Markdown")
-        return
+        if target not in chat_data.get("admins", []):
+            await update.message.reply_text(
+                f"❌ 用户 `{target}` 不是指定管理员", 
+                parse_mode="Markdown"
+            )
+            return
 
-    chat_data["admins"].remove(target)
-    await data_manager.update_chat_data(chat_id_str, chat_data)
-    await data_manager.force_save()
+        chat_data["admins"].remove(target)
+        await data_manager.update_chat_data(chat_id_str, chat_data)
+        await data_manager.force_save()
 
-    await update.message.reply_text(f"✅ **成功删除管理员**\n👤 用户ID: `{target}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ **成功删除管理员**\n👤 用户ID: `{target}`", 
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        print(f"❌ [del_admin] 执行异常: {e}")
+        await update.message.reply_text("❌ 删除管理员时发生错误，请稍后重试")
 
 
 async def adminlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -973,7 +1013,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🚀 打卡机器人已完全启动（啊原的第6个版本 - ）")
+    print("🚀 打卡机器人已完全启动（啊原的第6个版本 -6.0.6 ）")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
