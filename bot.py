@@ -1001,16 +1001,18 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     data_manager.load(force=True)
     
-    app = Application.builder() 
-        .token(TOKEN) 
-        .defaults(Defaults(tzinfo=TZ)) 
+    app = Application.builder() \
+        .token(TOKEN) \
+        .defaults(Defaults(tzinfo=TZ)) \
         .build()
     
     jq: JobQueue = app.job_queue
 
+    # 定时任务
     jq.run_daily(send_daily_report, time(5, 30, 0))
     jq.run_daily(data_manager.cleanup_old_data, time(6, 10, 0))
 
+    # 命令处理器
     handlers = [
         CommandHandler("start", start),
         CommandHandler("register", auto_register),
@@ -1026,12 +1028,13 @@ def main():
         CommandHandler("absent", absent),
         CommandHandler("today", today_cmd),
     ]
+    
     for h in handlers:
         app.add_handler(h)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🚀 打卡机器人已完全启动（啊原的第6个版本 -6.1.3 ）")
+    print("🚀 打卡机器人已完全启动（啊原的第6个版本 -6.1.5 ）")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
