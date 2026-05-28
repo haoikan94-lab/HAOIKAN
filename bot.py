@@ -1,6 +1,7 @@
 import json
 import os
 import asyncio
+import sys
 from datetime import datetime, timedelta, time
 import pandas as pd
 from telegram import Update
@@ -8,6 +9,12 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from zoneinfo import ZoneInfo
 import time as time_module
 import shutil
+
+# ================== 调试信息（Railway 部署诊断用） ==================
+print(f"🚀 Python 版本: {sys.version}")
+print(f"📁 当前工作目录: {os.getcwd()}")
+print(f"📂 DATA_PATH 路径: {os.getenv('DATA_PATH', '/data')}")
+print("✅ 所有模块导入完成\n")
 
 # ================== 配置区 ==================
 TOKEN = os.getenv("BOT_TOKEN")
@@ -17,13 +24,18 @@ if not TOKEN:
 print(f"✅ Bot Token 已成功加载 | 长度: {len(TOKEN)}")
 
 # ================== Railway Volume 配置 ==================
-DATA_PATH = os.getenv("DATA_PATH", "/data")
+DATA_PATH = os.getenv("DATA_PATH", "/data").rstrip("/")
 os.makedirs(DATA_PATH, exist_ok=True)
 
 DATA_FILE = os.path.join(DATA_PATH, "group_attendance.json")
 EXCEL_FOLDER = os.path.join(DATA_PATH, "excel_files")
+
+# 确保目录存在
 os.makedirs(EXCEL_FOLDER, exist_ok=True)
 
+print(f"📁 数据存储路径: {DATA_PATH}")
+print(f"📄 数据文件: {DATA_FILE}")
+print(f"📊 Excel 输出目录: {EXCEL_FOLDER}")
 # ================== 北京时间 ==================
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -208,31 +220,37 @@ class DataManager:
                         action = rec.get("action")
                         time_str = rec.get("time", "00:00:00")
                         try:
+                            # 解析时间
                             rec_time = datetime.strptime(time_str, "%H:%M:%S").time()
                             dummy_dt = datetime.strptime(old_date, "%Y-%m-%d").replace(
-                                hour=rec_time.hour, minute=rec_time.minute, 
-                                second=rec_time.second, tzinfo=TZ
+                                hour=rec_time.hour, 
+                                minute=rec_time.minute, 
+                                second=rec_time.second, 
+                                tzinfo=TZ
                             )
                             new_date = get_record_date(action, dummy_dt)
                             
                             if new_date not in new_records:
                                 new_records[new_date] = []
                             
+                            # 避免重复添加记录
                             if not any(
                                 r.get("time") == rec.get("time") and 
                                 r.get("action") == action and
                                 r.get("display") == rec.get("display")
-                                for r in new_records.get(new_date, []):
+                                for r in new_records[new_date]
                             ):
                                 new_records[new_date].append(rec.copy())
                                 if new_date != old_date:
                                     migrated_count += 1
                                     changed = True
                         except Exception:
+                            # 解析失败保留原日期
                             if old_date not in new_records:
                                 new_records[old_date] = []
                             new_records[old_date].append(rec.copy())
                 
+                # 替换为新的记录结构
                 user_info["records"] = new_records
         
         if migrated_count > 0 or changed:
@@ -1013,7 +1031,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🚀 打卡机器人已完全启动（啊原的第6个版本 -6.0.6 ）")
+    print("🚀 打卡机器人已完全启动（啊原的第6个版本 -6.1.3 ）")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
