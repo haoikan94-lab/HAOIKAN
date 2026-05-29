@@ -349,8 +349,9 @@ async def check_rest_timeout(context: ContextTypes.DEFAULT_TYPE):
     start_time = job_data["start_time"]
     
     try:
+        # 强制加载最新数据
         chat_data = await data_manager.get_chat_data(str(chat_id))
-        user_records = chat_data.get("users", {}).get(user_id, {}).get("records", {})
+        user_records = chat_data.get("users", {}).get(str(user_id), {}).get("records", {})
         today = get_attendance_date(beijing_now())
         records = user_records.get(today, [])
         
@@ -360,22 +361,23 @@ async def check_rest_timeout(context: ContextTypes.DEFAULT_TYPE):
         )
         
         if not still_resting:
+            print(f"✅ 休息已正常结束，无需提醒 (user={user_id})")
             return
 
-        user_name = chat_data.get("registered", {}).get(user_id, "用户")
+        user_name = chat_data.get("registered", {}).get(str(user_id), "用户")
         reminder_text = (
             f"⚠️ **休息超时提醒**\n\n"
             f"👤 {user_name}\n"
-            f"🕒 您已在 **{start_time}** 开始休息，\n"
-            f"已超过 **60分钟** 仍未结束休息（未打6）。\n\n"
+            f"🕒 开始时间：**{start_time}**\n"
+            f"已超过 **60分钟** 仍未结束休息。\n\n"
             f"请尽快回复 **6** 结束休息！"
         )
 
         try:
             await context.bot.send_message(chat_id=user_id, text=reminder_text, parse_mode="Markdown")
-            return
         except:
             await context.bot.send_message(chat_id=chat_id, text=reminder_text, parse_mode="Markdown")
+            
     except Exception as e:
         print(f"❌ 休息提醒任务执行异常: {e}")
 
@@ -508,13 +510,24 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
 
     if shift in ["6", "8"]:
         target = "rest_start" if shift == "6" else "work_rest_start"
+        ended = False
         for r in reversed(records):
             if r.get("type") == target and "rest_minutes" not in r:
                 rest_min = calculate_rest_duration(r["time"], time_str)
                 r["rest_minutes"] = rest_min
                 display = f"{action['name']}（{rest_min}分钟）"
+                ended = True
                 break
 
+        # 如果成功结束了休息，立即取消超时提醒 Job
+        if ended and shift == "6":
+            job_name = f"rest_timeout_{chat_id_str}_{user_id}"
+            current_jobs = context.job_queue.get_jobs_by_name(job_name)
+            for job in current_jobs:
+                job.schedule_removal()
+            print(f"🛑 已取消休息超时 Job: {job_name}（用户 {user.full_name}）")
+
+    # ================== 处理打卡记录 ==================
     records.append({
         "time": time_str,
         "action": shift,
@@ -523,18 +536,32 @@ async def daka(update: Update, context: ContextTypes.DEFAULT_TYPE, shift: str):
         "type": action.get("type")
     })
 
+    # ================== 开始休息时调度超时提醒 Job ==================
     if shift == "5":
-        job_name = f"rest_timeout_{chat_id_str}_{user_id}_{time_str}"
+        job_name = f"rest_timeout_{chat_id_str}_{user_id}"
+        # 先移除旧的 Job（防止短时间重复打5）
+        for old_job in context.job_queue.get_jobs_by_name(job_name):
+            old_job.schedule_removal()
+        
         context.job_queue.run_once(
             callback=check_rest_timeout,
             when=3600,
-            data={"chat_id": int(chat_id_str), "user_id": user_id, "start_time": time_str},
+            data={
+                "chat_id": int(chat_id_str), 
+                "user_id": user_id, 
+                "start_time": time_str
+            },
             name=job_name
         )
+        print(f"⏰ 已为 {user.full_name} 调度休息超时提醒 Job")
 
     await data_manager.update_chat_data(chat_id_str, chat_data)
+    # ================== 关键操作立即保存 ==================
+    if shift == "6":
+        await data_manager.force_save()   # 结束休息时强制保存，防止 Job 读取到旧数据
 
     emoji = "⚠️" if late > 0 else "✅"
+
     late_txt = f"（迟到{late}分钟）" if late > 0 else ""
     await update.message.reply_text(
         f"{emoji} **{user.full_name}** {display}{late_txt}\n日期：{date_str}\n时间：{time_str}",
@@ -1034,7 +1061,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_daka))
 
-    print("🚀 打卡机器人已完全启动（啊原的第6个版本 -6.1.5 ）")
+    print("🚀 打卡机器人已完全启动（啊原的第6个版本 -6.1.8 ）")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
